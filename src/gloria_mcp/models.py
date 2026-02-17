@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-X402_BASE = "https://x402.gloriaterminal.com"
+X402_BASE = "https://api.itsgloria.ai"
 
 FREE_NEWS_FIELDS = [
     "id",
