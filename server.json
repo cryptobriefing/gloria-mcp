@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jchen225/gloria-mcp",
+  "title": "Gloria AI",
+  "description": "Real-time curated crypto news for AI agents with sentiment, recaps, and search.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/cryptobriefing/gloria-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.itsgloria.ai/mcp"
+    }
+  ]
+}
