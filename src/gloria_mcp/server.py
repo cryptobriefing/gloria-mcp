@@ -17,12 +17,13 @@ load_dotenv()
 
 mcp = FastMCP(
     "Gloria AI",
-    version="0.1.0",
-    description=(
+    instructions=(
         "Real-time curated crypto news from Gloria AI. "
         "Covers 18 categories including Bitcoin, Ethereum, DeFi, AI, Solana, and more. "
         "News is sourced from crypto Twitter, filtered by AI for relevance, "
-        "and enriched with sentiment analysis and entity extraction."
+        "and enriched with sentiment analysis and entity extraction. "
+        "Use get_categories to discover available topics, then get_latest_news "
+        "or get_news_recap for data. Paid tools return x402 payment instructions."
     ),
 )
 
@@ -77,6 +78,8 @@ async def get_news_recap(category: str, timeframe: str = "12h") -> dict:
                    '8h' or '24h' for other categories. Default '12h'.
     """
     result = await _get_client().get_recap(category=category, timeframe=timeframe)
+    if result is None:
+        return {"error": f"No recap found for category '{category}' with timeframe '{timeframe}'."}
     return format_recap(result)
 
 
@@ -118,6 +121,8 @@ async def get_news_item(id: str) -> dict:
         id: The news item ID (returned in results from get_latest_news or search_news).
     """
     item = await _get_client().get_news_by_id(id)
+    if item is None:
+        return {"error": f"News item '{id}' not found."}
     return truncate_news(item)
 
 
@@ -199,7 +204,14 @@ async def categories_resource() -> str:
 
 
 def main():
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        port = int(os.environ.get("MCP_PORT", "8005"))
+        mcp.settings.port = port
+        mcp.settings.host = "0.0.0.0"
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

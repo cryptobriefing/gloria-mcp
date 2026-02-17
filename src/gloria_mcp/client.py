@@ -24,6 +24,8 @@ class GloriaClient:
         params = params or {}
         params["token"] = self._token
         resp = await client.get(path, params=params)
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
         return resp.json()
 

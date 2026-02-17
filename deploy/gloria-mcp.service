@@ -1,0 +1,18 @@
+[Unit]
+Description=Gloria AI MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/gloria-mcp
+Environment=PYTHONPATH=/home/ubuntu/gloria-mcp/src
+EnvironmentFile=/home/ubuntu/gloria-mcp/.env
+Environment=MCP_TRANSPORT=streamable-http
+Environment=MCP_PORT=8005
+ExecStart=/home/ubuntu/gloria-mcp/venv/bin/python -m gloria_mcp.server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
