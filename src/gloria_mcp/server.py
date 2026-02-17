@@ -4,6 +4,7 @@ import os
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from gloria_mcp.client import GloriaClient
 from gloria_mcp.models import (
@@ -209,6 +210,10 @@ def main():
         port = int(os.environ.get("MCP_PORT", "8005"))
         mcp.settings.port = port
         mcp.settings.host = "0.0.0.0"
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["mcp.itsgloria.ai", "localhost", "127.0.0.1"],
+        )
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
