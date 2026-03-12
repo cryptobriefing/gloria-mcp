@@ -4,14 +4,30 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gloria-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "MCP server for Gloria AI curated crypto news"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+keywords = ["mcp", "crypto", "news", "ai", "gloria"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "mcp[cli]>=1.26.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://itsgloria.ai"
+Repository = "https://github.com/cryptobriefing/gloria-mcp"
 
 [project.scripts]
 gloria-mcp = "gloria_mcp.server:main"
