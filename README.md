@@ -2,6 +2,10 @@
 
 MCP server providing real-time curated crypto news from [Gloria AI](https://itsgloria.ai) to AI agents.
 
+<a href="https://glama.ai/mcp/servers/cryptobriefing/gloria-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/cryptobriefing/gloria-mcp/badge" alt="gloria-mcp MCP server" />
+</a>
+
 ## Tools
 
 ### Free tier
