@@ -1,0 +1,317 @@
+name: Deploy to Production
+
+# The one sanctioned deploy path for gloria-mcp. See DEPLOY.md.
+#
+# TRANSPORT IS RSYNC, NOT `git pull` ON THE BOX. The runtime directory has
+# never been a git clone (verified 2026-08-07: no .git there) and it must not
+# become one. A .git on a runtime host invites `git pull` / `git checkout`
+# during an incident, which is how a sibling runtime in this estate lost two
+# commits and five stashes on 2026-07-16.
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_restart:
+        description: 'Restart the service even if no runtime file changed'
+        required: false
+        default: false
+        type: boolean
+
+# Two pushes close together give two runs against one box, and their rsync and
+# `systemctl restart` steps can interleave. cancel-in-progress is false on
+# purpose: a running deploy finishes rather than being killed mid-restart.
+concurrency:
+  group: deploy-prod-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    env:
+      AWS_INSTANCE_SG_ID: ${{ vars.AWS_INSTANCE_SG_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_PORT: ${{ vars.SSH_PORT }}
+      SSH_USERNAME: ${{ vars.SSH_USERNAME }}
+      APP_DIRECTORY: ${{ vars.APP_DIRECTORY }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      STATE_FILE: /tmp/gloria-mcp-deploy-${{ github.run_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: DeploySession
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get runner public IP
+        id: runner_ip
+        run: |
+          set -euo pipefail
+          ipv4=$(dig +short -4 txt ch whoami.cloudflare @1.0.0.1 | tr -d '"')
+          # Without this guard an empty or malformed lookup produces the CIDR
+          # "/32" and AWS rejects it with InvalidParameterValue, which reads
+          # like a permissions problem rather than a DNS failure.
+          if ! printf '%s' "$ipv4" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            echo "::error::Runner public IP lookup returned '$ipv4', which is not an IPv4 address. Cannot scope the security group rule."
+            exit 1
+          fi
+          echo "ipv4=$ipv4" >> $GITHUB_OUTPUT
+
+      # The list of top-level paths this commit tracks. scripts/drift-check.sh
+      # compares the box against it, so the allowlist updates itself whenever a
+      # file is added to or removed from the repo, instead of going stale.
+      - name: Compute tracked top-level paths
+        run: |
+          set -euo pipefail
+          echo "EXPECTED_TRACKED=$(git ls-tree --name-only HEAD | tr '\n' ' ')" >> $GITHUB_ENV
+
+      # This step IS load-bearing here, unlike in the appleboy-only workflows in
+      # this org where the same-looking step is dead code with a missing `$`.
+      # This job shells out to raw rsync with -i ~/.ssh/private_key.
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ env.SSH_PRIVATE_KEY }}" > ~/.ssh/private_key
+          chmod 600 ~/.ssh/private_key
+
+      - name: Whitelist runner IP
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.AWS_INSTANCE_SG_ID }} \
+            --protocol tcp \
+            --port 22 \
+            --cidr ${{ steps.runner_ip.outputs.ipv4 }}/32
+
+      # Fingerprint the runtime-relevant tree BEFORE anything is written, so the
+      # next step can tell whether a restart is actually warranted. A restart is
+      # not free: streamable-http MCP sessions are held in the server process and
+      # a restart drops every one of them. Deploying a README change should not
+      # disconnect live clients.
+      - name: Snapshot runtime fingerprint (pre-sync)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          port: ${{ env.SSH_PORT }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          envs: APP_DIRECTORY,STATE_FILE
+          script: |
+            set -e
+            cd "$APP_DIRECTORY"
+            # Runtime-relevant = what the systemd ExecStart actually loads.
+            # ExecStart is `venv/bin/python -m gloria_mcp.server` with
+            # PYTHONPATH=$APP_DIRECTORY/src, so ONLY src/*.py is executed code.
+            # requirements.txt is included because a dependency change needs a
+            # pip install and a restart. pyproject.toml is NOT included: it is
+            # PyPI packaging metadata consumed by .github/workflows/publish.yml
+            # on a GitHub Release, never by the running service.
+            find src -type f -name '*.py' -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > "$STATE_FILE.src" || true
+            sha256sum requirements.txt > "$STATE_FILE.req" || true
+            echo "pre-sync fingerprints written to $STATE_FILE.src and $STATE_FILE.req"
+
+      - name: Sync source to the box
+        run: |
+          set -euo pipefail
+          SSH_CMD="ssh -i ~/.ssh/private_key -p ${{ env.SSH_PORT }} -o StrictHostKeyChecking=no"
+          REMOTE="${{ env.SSH_USERNAME }}@${{ env.SSH_HOST }}"
+
+          echo "--- src/ (WITH --delete) ---"
+          # src/ holds nothing but git-tracked Python. --delete is correct and
+          # necessary here: a module deleted or renamed upstream that survives on
+          # the box stays importable via PYTHONPATH and silently shadows the new
+          # code. The blast radius is structurally bounded to this one directory.
+          rsync -rlz --delete --no-times --no-perms \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            -e "$SSH_CMD" \
+            src/ "${REMOTE}:${APP_DIRECTORY}/src/"
+
+          echo "--- top level (NO --delete, deliberately) ---"
+          # NO --delete at the top level. venv/ (the running interpreter) and
+          # .env (the secrets source of truth) both live here, and a --delete one
+          # exclude-list typo away from either is a catastrophic failure mode.
+          # Bounding the blast radius structurally beats guarding it with a
+          # check. The accumulation risk that creates is handled by
+          # scripts/drift-check.sh, which fails the deploy on any unexpected
+          # top-level entry.
+          rsync -rlz --no-times --no-perms \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='venv/' \
+            --exclude='.venv/' \
+            --exclude='.env' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.egg-info/' \
+            --exclude='dist/' \
+            --exclude='build/' \
+            -e "$SSH_CMD" \
+            ./ "${REMOTE}:${APP_DIRECTORY}/"
+
+          echo "Sync complete."
+
+      - name: Gate env, install if needed, restart if needed, assert health
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          FORCE_RESTART: ${{ github.event.inputs.force_restart }}
+        with:
+          host: ${{ env.SSH_HOST }}
+          port: ${{ env.SSH_PORT }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          envs: APP_DIRECTORY,APP_NAME,STATE_FILE,FORCE_RESTART
+          script: |
+            set -e
+            cd "$APP_DIRECTORY"
+            chmod +x scripts/check-env.sh scripts/health-check.sh scripts/drift-check.sh
+
+            # The host .env is the source of truth for this service's secrets.
+            # NOTHING in this pipeline creates, deletes or overwrites it.
+            # (2026-05-20 incident: a sibling repo's hardcoded `rm .env` plus an
+            # echo list silently truncated a host env to a stale 15-key subset on
+            # every deploy.) check-env.sh only READS it, and it runs before any
+            # restart so the service is never restarted into an env it cannot
+            # run on.
+            ./scripts/check-env.sh
+
+            # --- decide whether a pip install is warranted -------------------
+            REQ_CHANGED=0
+            sha256sum requirements.txt > "$STATE_FILE.req.after"
+            cmp -s "$STATE_FILE.req" "$STATE_FILE.req.after" || REQ_CHANGED=1
+
+            if [ "$REQ_CHANGED" = "1" ]; then
+              echo "requirements.txt changed. Installing."
+              # DELIBERATELY `-r requirements.txt`, never `pip install .` or
+              # `pip install -e .`. The systemd unit runs the source tree
+              # directly via PYTHONPATH=$APP_DIRECTORY/src; installing the
+              # package would put a SECOND copy of gloria_mcp in site-packages
+              # and which one wins becomes a sys.path accident.
+              ./venv/bin/pip install --disable-pip-version-check -r requirements.txt
+            else
+              # Deliberate: requirements.txt pins FLOORS (mcp[cli]>=1.26.0,
+              # httpx>=0.27.0, python-dotenv>=1.0.0), so every `pip install -r`
+              # is a chance to silently upgrade a dependency under a running
+              # production service. Running it only when the file changes bounds
+              # that. Pinning exact versions is the real fix, and a follow-up.
+              echo "requirements.txt unchanged. Skipping pip install."
+            fi
+
+            # --- decide whether a restart is warranted -----------------------
+            SRC_CHANGED=0
+            find src -type f -name '*.py' -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum > "$STATE_FILE.src.after"
+            cmp -s "$STATE_FILE.src" "$STATE_FILE.src.after" || SRC_CHANGED=1
+
+            if [ "$SRC_CHANGED" = "1" ] || [ "$REQ_CHANGED" = "1" ] || [ "$FORCE_RESTART" = "true" ]; then
+              echo "Restarting $APP_NAME (src_changed=$SRC_CHANGED req_changed=$REQ_CHANGED force=$FORCE_RESTART)."
+              sudo systemctl restart "$APP_NAME"
+            else
+              echo "No runtime file changed and force_restart not set. NOT restarting."
+              echo "Live MCP sessions are held in the server process; a needless restart drops every one of them."
+            fi
+
+            # --- assert health, restarted or not -----------------------------
+            # Unconditional. A deploy that changed nothing still has to prove the
+            # service is alive, otherwise a green run tells you nothing about
+            # production.
+            ./scripts/health-check.sh
+
+            rm -f "$STATE_FILE".* || true
+
+      # Proves the box equals git for every file git tracks. This is the Tier S
+      # substitute for a staging environment: there is no second box to compare
+      # against, so the check is "does production byte-match the commit".
+      #
+      # LIMITATION, stated rather than hidden: rsync --dry-run reports only what
+      # it WOULD send. It cannot see receiver-only files, so this proves
+      # "everything in git matches the box", not "the box has nothing extra".
+      # The extras half is the drift check in the next step.
+      - name: Parity check (box matches the deployed commit)
+        run: |
+          set -euo pipefail
+          SSH_CMD="ssh -i ~/.ssh/private_key -p ${{ env.SSH_PORT }} -o StrictHostKeyChecking=no"
+          REMOTE="${{ env.SSH_USERNAME }}@${{ env.SSH_HOST }}"
+
+          OUT=$(rsync -rln --checksum --itemize-changes --no-times --no-perms \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='venv/' \
+            --exclude='.venv/' \
+            --exclude='.env' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.egg-info/' \
+            --exclude='dist/' \
+            --exclude='build/' \
+            -e "$SSH_CMD" \
+            ./ "${REMOTE}:${APP_DIRECTORY}/")
+
+          if [ -n "$OUT" ]; then
+            echo "::error::PARITY FAILED. The box does not match the deployed commit. rsync would still change:"
+            echo "$OUT"
+            exit 1
+          fi
+          echo "PARITY OK: zero differences between the deployed commit and $APP_DIRECTORY."
+
+      - name: Drift check (the box holds nothing unexpected)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          port: ${{ env.SSH_PORT }}
+          username: ${{ env.SSH_USERNAME }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          envs: APP_DIRECTORY,EXPECTED_TRACKED
+          script: |
+            set -e
+            cd "$APP_DIRECTORY"
+            ./scripts/drift-check.sh
+
+      - name: Notify Discord on success
+        if: success()
+        uses: rjstone/discord-webhook-notify@v2
+        with:
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+          severity: info
+          details: "Deploy succeeded: **gloria-mcp**. Branch: `${{ github.ref_name }}`. Sha: `${{ github.sha }}`. By: ${{ github.actor }}."
+
+      - name: Notify Discord on failure
+        if: failure()
+        uses: rjstone/discord-webhook-notify@v2
+        with:
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+          severity: error
+          details: "Deploy **FAILED**: **gloria-mcp**. Branch: `${{ github.ref_name }}`. Sha: `${{ github.sha }}`. By: ${{ github.actor }}. [Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      # if: always() is the single most important line in this file. A step with
+      # no `if:` is implicitly `if: success()`, so on any failure above, the
+      # revoke would be SKIPPED and the runner's /32 would stay open on port 22
+      # permanently. Four workflows in this org have exactly that defect, and a
+      # security group in this estate carries three stale runner-shaped /32s as
+      # a result.
+      - name: Revoke runner IP
+        if: always()
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.AWS_INSTANCE_SG_ID }} \
+            --protocol tcp \
+            --port 22 \
+            --cidr ${{ steps.runner_ip.outputs.ipv4 }}/32 || true
+
+      - name: Clean up
+        if: always()
+        run: rm -rf ~/.ssh
