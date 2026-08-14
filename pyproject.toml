@@ -27,7 +27,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://itsgloria.ai"
-Repository = "https://github.com/cryptobriefing/gloria-mcp"
+Repository = "https://github.com/cryptobriefing-labs/gloria-mcp"
 
 [project.scripts]
 gloria-mcp = "gloria_mcp.server:main"
