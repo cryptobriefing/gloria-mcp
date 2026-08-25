@@ -49,10 +49,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4.0.2
+        uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           role-session-name: DeploySession
@@ -280,22 +280,6 @@ jobs:
             set -e
             cd "$APP_DIRECTORY"
             ./scripts/drift-check.sh
-
-      - name: Notify Discord on success
-        if: success()
-        uses: rjstone/discord-webhook-notify@v2
-        with:
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
-          severity: info
-          details: "Deploy succeeded: **gloria-mcp**. Branch: `${{ github.ref_name }}`. Sha: `${{ github.sha }}`. By: ${{ github.actor }}."
-
-      - name: Notify Discord on failure
-        if: failure()
-        uses: rjstone/discord-webhook-notify@v2
-        with:
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
-          severity: error
-          details: "Deploy **FAILED**: **gloria-mcp**. Branch: `${{ github.ref_name }}`. Sha: `${{ github.sha }}`. By: ${{ github.actor }}. [Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
       # if: always() is the single most important line in this file. A step with
       # no `if:` is implicitly `if: success()`, so on any failure above, the
